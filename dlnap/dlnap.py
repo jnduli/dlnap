@@ -316,7 +316,7 @@ def _get_port(location):
    location -- string like http://anyurl:port/whatever/path
    return -- port number
    """
-   port = re.findall('http://.*?:(\d+).*', location)
+   port = re.findall('http://.*?:(\\d+).*', location)
    return int(port[0]) if port else 80
 
 
@@ -378,7 +378,7 @@ def _get_location_url(raw):
     raw -- raw discovery response
     return -- location url string
     """
-    t = re.findall('\n(?i)location:\s*(.*)\r\s*', raw, re.M)
+    t = re.findall(r'\nlocation:\s*(.*)\r\s*', raw, re.M | re.I)
     if len(t) > 0:
         return t[0]
     return ''
