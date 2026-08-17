@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 
 # @file dlnap.py
 # @author cherezov.pavel@gmail.com
@@ -25,31 +25,28 @@
 
 __version__ = "0.15"
 
+import logging
+import mimetypes
+import os
 import re
-import sys
-import time
+import select
+import shutil
 import signal
 import socket
-import select
-import logging
-import traceback
-import mimetypes
-from contextlib import contextmanager
-
-
-import os
-py3 = sys.version_info[0] == 3
-if py3:
-    from urllib.request import urlopen
-    from http.server import HTTPServer
-    from http.server import BaseHTTPRequestHandler
-else:
-    from urllib2 import urlopen
-    from BaseHTTPServer import BaseHTTPRequestHandler
-    from BaseHTTPServer import HTTPServer
-
-import shutil
+import sys
 import threading
+import time
+import traceback
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.request import urlopen
+
+logger = logging.getLogger(__name__)
+
+
+class DlnapError(Exception):
+   """ Errors raised by dlnap discovery/control operations. """
+
 
 SSDP_GROUP = ("239.255.255.250", 1900)
 URN_AVTransport = "urn:schemas-upnp-org:service:AVTransport:1"
@@ -161,13 +158,13 @@ def _xml2dict(s, ignoreUntilXML = False):
    }
    """
    if ignoreUntilXML:
-      s = ''.join(re.findall(".*?(<.*)", s, re.M))
+      s = ''.join(re.findall(".*?(<.*)", s, re.MULTILINE))
 
    d = {}
    while s:
       tag, value, s = _get_tag_value(s)
       value = value.strip()
-      isXml, dummy, dummy2 = _get_tag_value(value)
+      isXml, _dummy, _dummy2 = _get_tag_value(value)
       if tag not in d:
          d[tag] = []
       if not isXml:
@@ -239,15 +236,10 @@ class DownloadProxy(BaseHTTPRequestHandler):
       url = self.path[1:] # replace '/'
 
       if os.path.exists(url):
-         f = open(url)
          content_type = mimetypes.guess_type(url)[0]
       else:
-         f = urlopen(url=url)
-
-         if py3:
+         with urlopen(url=url) as f:
             content_type = f.getheader("Content-Type")
-         else:
-            content_type = f.info().getheaders("Content-Type")[0]
 
       self.send_response(200, "ok")
       self.send_header('Access-Control-Allow-Origin', '*')
@@ -268,35 +260,29 @@ class DownloadProxy(BaseHTTPRequestHandler):
       url = self.path[1:] # replace '/'
 
       content_type = ''
-      if os.path.exists(url):
-         f = open(url)
-         content_type = mimetypes.guess_type(url)[0]
-         size = os.path.getsize(url)
-      elif not url or not url.startswith('http'):
+      is_local = os.path.exists(url)
+      if not is_local and (not url or not url.startswith('http')):
          self.response_success()
          return
-      else:
-         f = urlopen(url=url)
 
       try:
-         if not content_type:
-            if py3:
+         with open(url) if is_local else urlopen(url=url) as f:
+            if is_local:
+               content_type = mimetypes.guess_type(url)[0]
+               size = os.path.getsize(url)
+            else:
                content_type = f.getheader("Content-Type")
                size = f.getheader("Content-Length")
-            else:
-               content_type = f.info().getheaders("Content-Type")[0]
-               size = f.info().getheaders("Content-Length")[0]
 
-         self.send_response(200)
-         self.send_header('Access-Control-Allow-Origin', '*')
-         self.send_header("Content-Type", content_type)
-         self.send_header("Content-Disposition", 'attachment; filename="{}"'.format(os.path.basename(url)))
-         self.send_header("Content-Length", str(size))
-         self.end_headers()
-         shutil.copyfileobj(f, self.wfile)
+            self.send_response(200)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Disposition", f'attachment; filename="{os.path.basename(url)}"')
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            shutil.copyfileobj(f, self.wfile)
       finally:
          running = False
-         f.close()
 
 def runProxy(ip = '', port = 8000):
    global running
@@ -326,7 +312,7 @@ def _get_control_url(xml, urn):
    xml -- device description xml
    return -- control url or empty string if wasn't found
    """
-   return _xpath(xml, 'root/device/serviceList/service@serviceType={}/controlURL'.format(urn))
+   return _xpath(xml, f'root/device/serviceList/service@serviceType={urn}/controlURL')
 
 @contextmanager
 def _send_udp(to, packet):
@@ -358,14 +344,13 @@ def _send_tcp(to, payload):
       sock.sendall(payload.encode('utf-8'))
 
       data = sock.recv(2048)
-      if py3:
-         data = data.decode('utf-8')
+      data = data.decode('utf-8')
       data = _xml2dict(_unescape_xml(data), True)
 
       errorDescription = _xpath(data, 's:Envelope/s:Body/s:Fault/detail/UPnPError/errorDescription')
       if errorDescription is not None:
-         logging.error(errorDescription)
-   except Exception as e:
+         logger.error(errorDescription)
+   except Exception:  # noqa: BLE001 - malformed/unexpected responses from arbitrary devices
       data = ''
    finally:
       sock.close()
@@ -378,7 +363,7 @@ def _get_location_url(raw):
     raw -- raw discovery response
     return -- location url string
     """
-    t = re.findall(r'\nlocation:\s*(.*)\r\s*', raw, re.M | re.I)
+    t = re.findall(r'\nlocation:\s*(.*)\r\s*', raw, re.MULTILINE | re.IGNORECASE)
     if len(t) > 0:
         return t[0]
     return ''
@@ -410,7 +395,7 @@ class DlnapDevice:
 
    def __init__(self, raw, ip):
       self.__logger = logging.getLogger(self.__class__.__name__)
-      self.__logger.info('=> New DlnapDevice (ip = {}) initialization..'.format(ip))
+      self.__logger.info(f'=> New DlnapDevice (ip = {ip}) initialization..')
 
       self.ip = ip
       self.ssdp_version = 1
@@ -424,32 +409,32 @@ class DlnapDevice:
       try:
          self.__raw = raw.decode()
          self.location = _get_location_url(self.__raw)
-         self.__logger.info('location: {}'.format(self.location))
+         self.__logger.info(f'location: {self.location}')
 
          self.port = _get_port(self.location)
-         self.__logger.info('port: {}'.format(self.port))
+         self.__logger.info(f'port: {self.port}')
 
          raw_desc_xml = urlopen(self.location).read().decode()
 
          self.__desc_xml = _xml2dict(raw_desc_xml)
-         self.__logger.debug('description xml: {}'.format(self.__desc_xml))
+         self.__logger.debug(f'description xml: {self.__desc_xml}')
 
          self.name = _get_friendly_name(self.__desc_xml)
-         self.__logger.info('friendlyName: {}'.format(self.name))
+         self.__logger.info(f'friendlyName: {self.name}')
 
          self.control_url = _get_control_url(self.__desc_xml, URN_AVTransport)
-         self.__logger.info('control_url: {}'.format(self.control_url))
+         self.__logger.info(f'control_url: {self.control_url}')
 
          self.rendering_control_url = _get_control_url(self.__desc_xml, URN_RenderingControl)
-         self.__logger.info('rendering_control_url: {}'.format(self.rendering_control_url))
+         self.__logger.info(f'rendering_control_url: {self.rendering_control_url}')
 
          self.has_av_transport = self.control_url is not None
-         self.__logger.info('=> Initialization completed'.format(ip))
-      except Exception as e:
-         self.__logger.warning('DlnapDevice (ip = {}) init exception:\n{}'.format(ip, traceback.format_exc()))
+         self.__logger.info('=> Initialization completed')
+      except Exception:  # noqa: BLE001 - malformed device description XML from arbitrary devices
+         self.__logger.warning(f'DlnapDevice (ip = {ip}) init exception:\n{traceback.format_exc()}')
 
    def __repr__(self):
-      return '{} @ {}'.format(self.name, self.ip)
+      return f'{self.name} @ {self.ip}'
 
    def __eq__(self, d):
       return self.name == d.name and self.ip == d.ip
@@ -459,16 +444,16 @@ class DlnapDevice:
       """
       fields = ''
       for tag, value in data.items():
-        fields += '<{tag}>{value}</{tag}>'.format(tag=tag, value=value)
+        fields += f'<{tag}>{value}</{tag}>'
 
-      payload = """<?xml version="1.0" encoding="utf-8"?>
+      payload = f"""<?xml version="1.0" encoding="utf-8"?>
          <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
             <s:Body>
                <u:{action} xmlns:u="{urn}">
                   {fields}
                </u:{action}>
             </s:Body>
-         </s:Envelope>""".format(action=action, urn=urn, fields=fields)
+         </s:Envelope>"""
       return payload
 
    def _create_packet(self, action, data):
@@ -486,13 +471,13 @@ class DlnapDevice:
       payload = self._payload_from_template(action=action, data=data, urn=urn)
 
       packet = "\r\n".join([
-         'POST {} HTTP/1.1'.format(url),
-         'User-Agent: {}/{}'.format(__file__, __version__),
+         f'POST {url} HTTP/1.1',
+         f'User-Agent: {__file__}/{__version__}',
          'Accept: */*',
          'Content-Type: text/xml; charset="utf-8"',
-         'HOST: {}:{}'.format(self.ip, self.port),
-         'Content-Length: {}'.format(len(payload)),
-         'SOAPACTION: "{}#{}"'.format(urn, action),
+         f'HOST: {self.ip}:{self.port}',
+         f'Content-Length: {len(payload)}',
+         f'SOAPACTION: "{urn}#{action}"',
          'Connection: close',
          '',
          payload,
@@ -621,12 +606,12 @@ def discover(name = '', ip = '', timeout = 1, st = SSDP_ALL, mx = 3, ssdp_versio
    st = st.format(ssdp_version)
    payload = "\r\n".join([
               'M-SEARCH * HTTP/1.1',
-              'User-Agent: {}/{}'.format(__file__, __version__),
+              f'User-Agent: {__file__}/{__version__}',
               'HOST: {}:{}'.format(*SSDP_GROUP),
               'Accept: */*',
               'MAN: "ssdp:discover"',
-              'ST: {}'.format(st),
-              'MX: {}'.format(mx),
+              f'ST: {st}',
+              f'MX: {mx}',
               '',
               ''])
    devices = []
@@ -636,7 +621,7 @@ def discover(name = '', ip = '', timeout = 1, st = SSDP_ALL, mx = 3, ssdp_versio
          if time.time() - start > timeout:
             # timed out
             break
-         r, w, x = select.select([sock], [], [sock], 1)
+         r, _w, x = select.select([sock], [], [sock], 1)
          if sock in r:
              data, addr = sock.recvfrom(1024)
              if ip and addr[0] != ip:
@@ -644,17 +629,16 @@ def discover(name = '', ip = '', timeout = 1, st = SSDP_ALL, mx = 3, ssdp_versio
 
              d = DlnapDevice(data, addr[0])
              d.ssdp_version = ssdp_version
-             if d not in devices:
-                if not name or name is None or name.lower() in d.name.lower():
-                   if not ip:
-                      devices.append(d)
-                   elif d.has_av_transport:
-                      # no need in further searching by ip
-                      devices.append(d)
-                      break
+             if d not in devices and (not name or name is None or name.lower() in d.name.lower()):
+                if not ip:
+                   devices.append(d)
+                elif d.has_av_transport:
+                   # no need in further searching by ip
+                   devices.append(d)
+                   break
 
          elif sock in x:
-             raise Exception('Getting response failed')
+             raise DlnapError('Getting response failed')
          else:
              # Nothing to read
              pass
@@ -673,7 +657,7 @@ if __name__ == '__main__':
    import getopt
 
    def usage():
-      print('{} [--ip <device ip>] [-d[evice] <name>] [--all] [-t[imeout] <seconds>] [--play <url>] [--pause] [--stop] [--proxy]'.format(__file__))
+      print(f'{__file__} [--ip <device ip>] [-d[evice] <name>] [--all] [-t[imeout] <seconds>] [--play <url>] [--pause] [--stop] [--proxy]')
       print(' --ip <device ip> - ip address for faster access to the known device')
       print(' --device <device name or part of the name> - discover devices with this name as substring')
       print(' --all - flag to discover all upnp devices, not only devices with AVTransport ability')
@@ -736,7 +720,7 @@ if __name__ == '__main__':
    position = '00:00:00'
    timeout = 1
    action = ''
-   logLevel = logging.WARN
+   logLevel = logging.WARNING
    compatibleOnly = True
    ip = ''
    proxy = False
@@ -755,7 +739,7 @@ if __name__ == '__main__':
          elif arg.lower() == 'info':
              logLevel = logging.INFO
          elif arg.lower() == 'warn':
-             logLevel = logging.WARN
+             logLevel = logging.WARNING
       elif opt in ('--all'):
          compatibleOnly = False
       elif opt in ('-d', '--device'):
@@ -831,12 +815,12 @@ if __name__ == '__main__':
    if action == 'play':
       try:
          d.stop()
-         url = 'http://{}:{}/{}'.format(ip, proxy_port, url) if proxy else url
+         url = f'http://{ip}:{proxy_port}/{url}' if proxy else url
          d.set_current_media(url=url)
          d.play()
-      except Exception as e:
+      except Exception:  # noqa: BLE001 - any failure here means playback could not start
          print('Device is unable to play media.')
-         logging.warn('Play exception:\n{}'.format(traceback.format_exc()))
+         logger.warning(f'Play exception:\n{traceback.format_exc()}')
          sys.exit(1)
    elif action == 'pause':
       d.pause()
